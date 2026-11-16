@@ -54,7 +54,7 @@ your session (coordinator)          board = append-log with seq numbers
 
 | Tool | Call |
 |---|---|
-| `swarm` | `{action:"add", name:"parser", brief:"…"}` · `{action:"status"}` · `{action:"kill", name}` · `{action:"title", title}` · `{action:"models"}` · `{action:"model", name, model:"provider/id"}` |
+| `swarm` | `{action:"add", name:"parser", brief:"…"}` · `{action:"status"}` (live session state) · `{action:"kill", name}` · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (best effort, untested on this build) |
 | `post_message` | `{text:"@verifier check #4"}` — mention = wake |
 | `read_board` | `{since: 12}` — posts newer than a seq |
 | `swarm_wait` | `{since: 12}` — sleeps until the board moves (60 s cap) |
