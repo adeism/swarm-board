@@ -26,7 +26,26 @@ let db = { swarms: {}, memberIndex: {} };
 try { db = JSON.parse(fs.readFileSync(FILE, "utf8")); } catch { /* fresh board */ }
 db.swarms ??= {};
 db.memberIndex ??= {};
-const save = () => { try { fs.writeFileSync(FILE, JSON.stringify(db)); } catch {} };
+
+// Two plugin instances coexist across a hot reload, each with its own db. The
+// board with the higher seq is the truth: adopt it and never write a stale
+// snapshot over it (a stale tick once replaced a 45-post board with a 38-post one).
+function newerBoards(disk, mem) {
+  const out = {};
+  for (const [id, b] of Object.entries(disk?.swarms ?? {})) {
+    if ((b.seq ?? 0) > (mem?.swarms?.[id]?.seq ?? -1)) out[id] = b;
+  }
+  return out;
+}
+
+function adoptNewer() {
+  let disk;
+  try { disk = JSON.parse(fs.readFileSync(FILE, "utf8")); } catch { return; }
+  for (const [id, b] of Object.entries(newerBoards(disk, db))) db.swarms[id] = b;
+  db.memberIndex = { ...(disk?.memberIndex ?? {}), ...db.memberIndex };
+}
+
+const save = () => { try { adoptNewer(); fs.writeFileSync(FILE, JSON.stringify(db)); } catch {} };
 
 const waiters = []; // { coordID, sessionID, names, resolve }
 
@@ -706,6 +725,7 @@ async function tick() {
   if (!ctx || ticking) return;
   ticking = true;
   try {
+    adoptNewer(); // a newer instance may have posted since our last save
     for (const [coordID, b] of Object.entries(db.swarms)) {
       for (const [name, m] of Object.entries(b.members ?? {})) {
         try { await reconcileMember(m); } catch {}
@@ -1093,5 +1113,5 @@ export const _pure = {
   mentionedNames, mentionedChannels, markerOf, looksLikePseudoToolCall, idleNow,
   channelOf, channelsOf, isPrivileged, canSee, visiblePosts, defaultChannel,
   wakeHit, mayMove, channelForPost, boardSnapshot, renderBoardHtml,
-  expandAddTargets, groupTargets, mentionHit,
+  expandAddTargets, groupTargets, mentionHit, newerBoards,
 };

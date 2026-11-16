@@ -143,6 +143,14 @@ test("a group mention wakes every copy", () => {
   assert.equal(P.wakeHit(gb, { who: "g-1", channels: ["main"], mentionsOnly: true }, { ...p, from: "g-1" }), false, "own post");
 });
 
+test("a stale instance cannot overwrite a newer board", () => {
+  const mem = { swarms: { a: { seq: 45, posts: [] }, b: { seq: 2 } } };
+  const disk = { swarms: { a: { seq: 38, posts: [] }, b: { seq: 5 } }, memberIndex: {} };
+  assert.deepEqual(Object.keys(P.newerBoards(disk, mem)), ["b"], "only the board the disk is ahead on");
+  assert.deepEqual(Object.keys(P.newerBoards({ swarms: mem.swarms }, {})), ["a", "b"], "empty memory adopts everything");
+  assert.deepEqual(P.newerBoards({ swarms: {} }, mem), {}, "nothing on disk to adopt");
+});
+
 test("snapshot and html escaping", () => {
   const evil = {
     ...board,
