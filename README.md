@@ -13,7 +13,9 @@ plugin that registers those four tools and runs the board.
 Tier 1 autopilot is included: live-state reconciliation, a `[done]/[blocked]/[stall]`
 marker state machine, a built-in `[stall]` monitor, and auto-heal for local
 models that print tool calls as text. Tier 2 adds channels and a static local
-board UI (Board / Members / Graph) with no server and no extra dependency.
+board UI (Board / Members / Graph) with no server and no extra dependency. Tier 3
+adds group adds: `n`/`tasks` spawn several copies in one call, and `@group` /
+`kill{name:"group"}` reach all of them.
 
 | Repo file | Goes to (global OpenCode config dir) |
 |---|---|
@@ -65,13 +67,34 @@ your session (coordinator)          board = append-log with seq numbers
 
 | Tool | Call |
 |---|---|
-| `swarm` | `{action:"add", name:"parser", brief:"…", channels:["parser"]}` · `{action:"status"}` (roster incl. channels, quiet time, heal count, `open_board` URL) · `{action:"channel", op:"create"\|"subscribe"\|"unsubscribe"\|"list"\|"archive", channel, topic?, name?}` · `{action:"kill", name}` · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (best effort, untested on this build) |
+| `swarm` | `{action:"add", name:"parser", brief:"…", channels:["parser"]}` — one worker · `{action:"add", name:"parser", brief:"…", n:3}` or `{…, tasks:["lexer","parser"]}` — a group `parser-1…parser-k`, max 8 · `{action:"status"}` (roster incl. channels, quiet time, heal count, `open_board` URL) · `{action:"channel", op:"create"\|"subscribe"\|"unsubscribe"\|"list"\|"archive", channel, topic?, name?}` · `{action:"kill", name}` (a group name kills every copy) · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (group name switches every copy; best effort, untested on this build) |
 | `post_message` | `{text:"@verifier check #4", channel:"parser"}` — mention = wake; `channel` defaults to your work channel |
 | `read_board` | `{since:12}` (your view) · `{since:12, channel:"parser"}` (one channel) · `{channel:"*"}` (everything) |
 | `swarm_wait` | `{since:12}` — waits for your name / `@all` / `@#your-channel`; `{mentions_only:false}` also wakes for plain posts in your channels (60 s cap) |
 
 Worker names: lowercase `[a-z0-9-]`; `all` / `coordinator` are reserved; killed
 names cannot be reused. Channel names use the same pattern, except `main`.
+
+## Groups (`n` / `tasks`)
+
+When the work is homogeneous or shardable, spawn several copies in one call:
+`add{name:"parser", brief:"…", n:3}` gives `@parser-1`…`@parser-3` the same brief;
+`add{name:"parser", brief:"…", tasks:["lexer","parser"]}` gives each copy its own
+slice (`Your slice of this task: lexer`) on top of the shared brief. Max 8 workers
+per call; `n` and `tasks` are mutually exclusive.
+
+- **`@parser` reaches the whole group**: every copy is woken, and
+  `kill{name:"parser"}` kills all of them at once
+  (`group @parser killed: parser-1, parser-2`).
+- **`@parser-1` reaches that copy only.** Each copy is told it is one of N, so it
+  acts when the post names its own name or matches its slice.
+- Markers, heals and stall silence stay per copy: `status` lists `parser-1:` and
+  `parser-2:` as separate lines, so one finished shard reads `[done]` on its own.
+- Group copies are ordinary members everywhere else (channels, helpers that inherit
+  the adder's channels, `monitor` privileges).
+- All names are checked **before** the first session is created, so a call with one
+  taken name spawns nothing. If a spawn fails midway, the tool returns what was
+  added and which copy failed instead of throwing.
 
 ## Channels
 
@@ -145,6 +168,23 @@ UI in Chromium: 33 posts, 10 members, 4 channels, 0 console errors;
     Graph tabs render. scout needed one auto-heal before it posted.
 #beta / #gamma archived: posting rejected, read_board history still works;
     @#main refused; posting to an unknown channel rejected.
+```
+
+Tier 3 live check (same server, 2026-11-16, groups):
+
+```
+#35 group @grp on #main: #35 @grp-1, #36 @grp-2   ← add{name:"grp", n:2}
+#40 grp-1: @coordinator [done] grp-1 awake
+#41 grp-2: @coordinator [done] grp-2 awake         ← @grp woke both copies
+#42 coordinator: @grp-1 …                          (only that copy addressed)
+#43 grp-1: @coordinator [done] grp-1 solo          ← grp-2 stayed quiet
+    kill{name:"grp"} → group @grp killed: grp-1, grp-2
+    add{name:"slice", tasks:["count the files in src/","count the lines in README.md"]}
+        → #44 @slice-1 … Your slice of this task: count the files in src/
+          #45 @slice-2 … Your slice of this task: count the lines in README.md
+    add{n:9} → rejected by the tool schema; add{n:2, tasks:[…]} → "pass either n or
+        tasks, not both"; add{name:"grp", n:1} → "@grp-1 exists; killed names cannot
+        be reused" (nothing spawned)
 ```
 
 ## Usage
@@ -239,9 +279,9 @@ run two is the local model's tool-calling, not the board — see Limitations.
   2 correction prompts; if the model still refuses, the member shows
   `needs help (heal cap)` — nudge `@name` or kill/replace. Trust raw test output,
   never a worker's claim.
-- No `fork:`, `workspace:"share"` worktrees, batched `n`/`tasks` adds, or
-  per-provider quota in `models`. The stall monitor is built into the plugin
-  (no `swarm_monitor` skill/worker needed).
+- No `fork:`, `workspace:"share"` worktrees, or per-provider quota in `models`.
+  The stall monitor is built into the plugin (no `swarm_monitor` skill/worker
+  needed). (`n`/`tasks` groups are implemented — see [Groups](#groups-ntasks).)
 - No narrator (`swarm_narrator`): its upstream UI/protocol is not shipped here.
   A narrator worker would be a normal member; the static UI covers the overview.
 - The UI is a read-only static file that reloads every 3 s: no streaming, no
@@ -255,6 +295,16 @@ run two is the local model's tool-calling, not the board — see Limitations.
 - A wake arrives in the worker's session as a user message; weak local models
   occasionally need a firmer brief.
 - One board per coordinator session; two coordinators never share a board.
+- A member whose first prompt never lands (the inference backend was down when
+  `add` ran) is recorded as `stopped: first prompt failed: …` rather than left
+  looking busy. A post naming it retries, or `kill` it and add it again.
+
+## Tests
+
+`node --test` (Node 22+, no dependencies): mention and channel parsing,
+visibility and defaults, wake rules, group naming/validation/addressing, and the
+HTML snapshot escaping. The plugin is the test target, so a green run means the
+shipped file — `plugins/swarm-board.js` — behaves as described.
 
 ## Attribution & license
 

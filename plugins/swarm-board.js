@@ -19,6 +19,7 @@ const WAIT_TIMEOUT_MS = 60_000;
 const STALL_MS = 180_000;   // board quiet this long with live members => monitor [stall]
 const TICK_MS = 15_000;     // reconcile live session state + heal pseudo tool calls
 const HEAL_CAP = 2;         // max auto-heal prompts per worker session
+const GROUP_CAP = 8;        // max workers one add{n|tasks} call will spawn
 const CHANNEL_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 let db = { swarms: {}, memberIndex: {} };
@@ -49,6 +50,38 @@ function mentionedChannels(text) {
   const set = new Set();
   for (const m of String(text ?? "").matchAll(/@#([a-z0-9][a-z0-9-]*)/gi)) set.add(m[1].toLowerCase());
   return set;
+}
+
+// add{n:k} / add{tasks:[…]} spawn a group: <base>-1..<base>-k, one slice each.
+function expandAddTargets({ name, n, tasks }) {
+  const base = String(name ?? "").toLowerCase();
+  if (n != null && tasks != null) throw new Error("pass either n or tasks, not both");
+  if (tasks != null) {
+    if (!Array.isArray(tasks) || tasks.length === 0) throw new Error("tasks must be a non-empty array of strings");
+    if (tasks.some((s) => typeof s !== "string" || !s.trim())) throw new Error("every task must be a non-empty string");
+    if (tasks.length > GROUP_CAP) throw new Error(`tasks is capped at ${GROUP_CAP} workers`);
+    return tasks.map((slice, i) => ({ name: `${base}-${i + 1}`, slice: String(slice).trim() }));
+  }
+  if (n != null) {
+    const k = Number(n);
+    if (!Number.isInteger(k) || k < 1) throw new Error("n must be an integer >= 1");
+    if (k > GROUP_CAP) throw new Error(`n is capped at ${GROUP_CAP} workers`);
+    return Array.from({ length: k }, (_, i) => ({ name: `${base}-${i + 1}`, slice: "" }));
+  }
+  return [{ name: base, slice: "" }];
+}
+
+// One @token (or kill name) hits the member itself or every copy of its group.
+function groupTargets(board, token) {
+  const t = String(token ?? "").toLowerCase();
+  const members = board?.members ?? {};
+  return Object.keys(members).filter((n) => n === t || members[n].group === t);
+}
+
+function mentionHit(board, names, who) {
+  if (names.has(who)) return true;
+  const g = board?.members?.[who]?.group;
+  return Boolean(g && names.has(g));
 }
 
 function channelOf(p) { return p.channel ?? "main"; }
@@ -84,7 +117,7 @@ function wakeHit(board, w, p) {
   if (p.from === w.who) return false;
   if (w.who === "coordinator") return true;
   const names = mentionedNames(p.text);
-  if (names.has("all") || names.has(w.who)) return true;
+  if (names.has("all") || mentionHit(board, names, w.who)) return true;
   for (const c of mentionedChannels(p.text)) {
     const rec = board.channels?.[c];
     if (rec && !rec.archived && w.channels.includes(c)) return true;
@@ -136,7 +169,7 @@ function deliver(coordID, post) {
       const rec = board.channels?.[c];
       return rec && !rec.archived && (m.channels ?? []).includes(c);
     });
-    if (mentions.has(name) || mentions.has("all") || calledChannel) prompt(m.sessionID);
+    if (mentionHit(board, mentions, name) || mentions.has("all") || calledChannel) prompt(m.sessionID);
   }
   if (post.from !== "coordinator") {
     if (mentions.has("coordinator")) prompt(coordID);
@@ -715,15 +748,18 @@ function startEngine() {
   g.__swarmBoardTicker.unref?.();
 }
 
-const WORKER_RULES = (name, title, seq, chans, adder) => {
+const WORKER_RULES = (name, title, seq, chans, adder, group) => {
   const subs = chans.length ? chans.map((c) => `#${c}`).join(", ") : "(none)";
   const home = chans[0] ?? "main";
+  const groupRule = group
+    ? `\n- You are one of ${group.size} copies in the group @${group.base}: a post to @${group.base} is aimed at every copy, so act and reply only when the post names @${name} or matches the slice in your brief.`
+    : "";
   return `You are '@${name}', a worker in swarm '${title}'. The brief is at the end of this message; the board head is #${seq}.
 Channels: everyone is in #main; you are also subscribed to ${subs}. Post in #${home} by default, and in #main only for traffic the whole swarm needs.
 Rules:
 - Do the work with normal tools. The board is your only channel to other agents: call post_message to speak; start every post with the recipient '@<name> <text>' and @mention only whoever acts next.
 - When fully done: post '@${adder} [done] <summary + evidence>'. When blocked: '@${adder} [blocked] <reason>'.
-- A later message that names you, or calls your channel (@#name), is board traffic: act on it, then answer the poster via post_message, then end your turn. Ending your turn parks you; a post naming you wakes you.
+- A later message that names you, or calls your channel (@#name), is board traffic: act on it, then answer the poster via post_message, then end your turn. Ending your turn parks you; a post naming you wakes you.${groupRule}
 - Do not kill members, do not rename the swarm, do not spawn your own swarm unless your brief says so.
 
 Brief:`;
@@ -740,10 +776,12 @@ export default {
         name: "swarm",
         description:
           "Run the swarm board. action=add {name,brief,channels[]}: spawn worker @name on its own session. " +
-          "action=status: roster, channels, and the local board UI URL. action=kill {name}: stop a worker. " +
+          "action=add {name,brief,n} or {name,brief,tasks[]} (max 8): spawn @name-1…@name-k as one group; " +
+          "@name and kill{name:'name'} reach the whole group, @name-1 one copy. " +
+          "action=status: roster, channels, and the local board UI URL. action=kill {name}: stop a worker or a whole group. " +
           "action=title {title}: name the swarm. " +
           "action=channel {op:create|subscribe|unsubscribe|list|archive, channel, topic, name}: manage channels. " +
-          "action=models: list runnable models. action=model {name,model 'provider/id'}: switch a member's model.",
+          "action=models: list runnable models. action=model {name,model 'provider/id'}: switch a member's or group's model.",
         input: {
           type: "object",
           properties: {
@@ -752,6 +790,8 @@ export default {
             brief: { type: "string" },
             title: { type: "string" },
             channels: { type: "array", items: { type: "string" } },
+            n: { type: "integer", minimum: 1, maximum: 8, description: "spawn name-1…name-n copies" },
+            tasks: { type: "array", items: { type: "string" }, maxItems: 8, description: "one slice per worker, shared instructions in brief" },
             op: { type: "string", enum: ["create", "subscribe", "unsubscribe", "list", "archive"] },
             channel: { type: "string" },
             topic: { type: "string" },
@@ -781,7 +821,10 @@ export default {
             const name = String(args.name || "").toLowerCase();
             if (!/^[a-z0-9][a-z0-9-]*$/.test(name) || name === "all" || name === "coordinator")
               throw new Error("name must be lowercase [a-z0-9-] and not all/coordinator");
-            if (board.members[name]) throw new Error(`@${name} exists; kill it first (killed names cannot be reused)`);
+            const targets = expandAddTargets({ name, n: args.n, tasks: args.tasks });
+            const taken = targets.map((t) => t.name).filter((n) => board.members[n]);
+            if (taken.length)
+              throw new Error(`@${taken.join(", @")} exists; killed names cannot be reused`);
             const inherited = adder !== "coordinator" ? board.members[adder]?.channels ?? [] : [];
             const wanted = args.channels ?? inherited;
             const channels = [...new Set((Array.isArray(wanted) ? wanted : [])
@@ -792,20 +835,47 @@ export default {
               if (rec.archived) throw new Error(`#${c} is archived`);
             }
             const home = channels.find((c) => board.channels[c] && !board.channels[c].archived) ?? "main";
-            const p = post(sessionID, adder, `@${name} ${args.brief || "(no brief given — ask the coordinator)"}`, home);
-            const created = await ctx.session.create({ title: `[swarm ${board.title}] @${name}` });
-            const workerID = created?.id ?? created?.data?.id;
-            if (!workerID) throw new Error("session.create returned no id: " + JSON.stringify(created)?.slice(0, 200));
-            board.members[name] = {
-              sessionID: workerID, status: "working", channels,
-              addedBy: adder === "coordinator" ? null : adder,
-            };
-            db.memberIndex[workerID] = { coordID: sessionID, name };
-            save();
-            writeUi(sessionID);
-            await ctx.session.prompt({ sessionID: workerID, text:
-              WORKER_RULES(name, board.title, p.seq, channels, adder) + " " + (args.brief || "") });
-            return { content: `#${p.seq} @${name} added on #${home} (session ${workerID})` };
+            const group = args.n != null || args.tasks != null ? name : null;
+            const added = [];
+            let failed = null;
+            for (const t of targets) {
+              const brief = [args.brief, t.slice && `Your slice of this task: ${t.slice}`]
+                .filter(Boolean).join(" ").trim();
+              try {
+                const created = await ctx.session.create({ title: `[swarm ${board.title}] @${t.name}` });
+                const workerID = created?.id ?? created?.data?.id;
+                if (!workerID) throw new Error("session.create returned no id: " + JSON.stringify(created)?.slice(0, 200));
+                const p = post(sessionID, adder, `@${t.name} ${brief || "(no brief given — ask the coordinator)"}`, home);
+                board.members[t.name] = {
+                  sessionID: workerID, status: "working", channels,
+                  addedBy: adder === "coordinator" ? null : adder,
+                  ...(group ? { group } : {}),
+                };
+                db.memberIndex[workerID] = { coordID: sessionID, name: t.name };
+                save();
+                writeUi(sessionID);
+                await ctx.session.prompt({ sessionID: workerID, text:
+                  WORKER_RULES(t.name, board.title, p.seq, channels, adder,
+                    group && { base: group, size: targets.length }) + " " + brief });
+                added.push({ seq: p.seq, name: t.name, sessionID: workerID });
+              } catch (e) {
+                // A member whose first prompt never landed would sit at "working"
+                // forever (its session has no outcome), so say so right away.
+                if (board.members[t.name])
+                  board.members[t.name].status = `stopped: first prompt failed: ${String(e?.message ?? e).slice(0, 120)}`;
+                save();
+                failed = `${String(e?.message ?? e).slice(0, 200)}`;
+                break;
+              }
+            }
+            const head = !added.length ? "nothing added"
+              : group
+                ? `group @${group} on #${home}: ${added.map((a) => `#${a.seq} @${a.name}`).join(", ")} · @${group} reaches every copy`
+                : `#${added[0].seq} @${added[0].name} added on #${home} (session ${added[0].sessionID})`;
+            return { content: failed
+              ? `${head}\nfailed at @${targets[added.length].name}: ${failed} — what is listed above stays alive. ` +
+                `Spawn the rest with add{name:"<free name>", brief:…}; a member shown as stopped gets its turn back when someone posts @name.`
+              : head };
           }
           if (args.action === "channel") {
             const h = boardFor(sessionID);
@@ -882,13 +952,17 @@ export default {
           if (args.action === "kill") {
             const h = boardFor(sessionID);
             if (!h) throw new Error("no swarm");
-            const m = h.board.members[args.name];
-            if (!m) throw new Error(`no member @${args.name}`);
-            m.status = "killed";
+            const names = groupTargets(h.board, args.name);
+            if (!names.length) throw new Error(`no member @${args.name}`);
+            for (const n of names) {
+              const m = h.board.members[n];
+              m.status = "killed";
+              try { await ctx.session.interrupt?.({ sessionID: m.sessionID, resume: false }); } catch {}
+            }
             save();
             writeUi(h.coordID);
-            try { await ctx.session.interrupt?.({ sessionID: m.sessionID, resume: false }); } catch {}
-            return { content: `@${args.name} killed` };
+            return { content: names.length === 1 ? `@${names[0]} killed`
+              : `group @${args.name} killed: ${names.join(", ")}` };
           }
           if (args.action === "models") {
             try {
@@ -900,12 +974,13 @@ export default {
           if (args.action === "model") {
             const h = boardFor(sessionID);
             if (!h) throw new Error("no swarm");
-            const target = !args.name || args.name === "coordinator" ? h.coordID
-              : h.board.members[args.name]?.sessionID;
-            if (!target) throw new Error(`no member @${args.name}`);
+            const targets = !args.name || args.name === "coordinator" ? [h.coordID]
+              : groupTargets(h.board, args.name).map((n) => h.board.members[n].sessionID);
+            if (!targets.length) throw new Error(`no member @${args.name}`);
             const [providerID, ...rest] = String(args.model).split("/");
             try {
-              await ctx.session.switchModel({ sessionID: target, model: { providerID, id: rest.join("/") } });
+              for (const target of targets)
+                await ctx.session.switchModel({ sessionID: target, model: { providerID, id: rest.join("/") } });
               return { content: `@${args.name ?? "coordinator"} switched to ${args.model}` };
             } catch (e) { return { content: "model switch unsupported/failed: " + e.message }; }
           }
@@ -1018,4 +1093,5 @@ export const _pure = {
   mentionedNames, mentionedChannels, markerOf, looksLikePseudoToolCall, idleNow,
   channelOf, channelsOf, isPrivileged, canSee, visiblePosts, defaultChannel,
   wakeHit, mayMove, channelForPost, boardSnapshot, renderBoardHtml,
+  expandAddTargets, groupTargets, mentionHit,
 };
