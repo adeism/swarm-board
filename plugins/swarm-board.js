@@ -147,8 +147,17 @@ export default {
             const h = boardFor(sessionID);
             if (!h) throw new Error("no swarm for this session; swarm{action:'add'} or 'title' first");
             const b = h.board;
-            const roster = Object.entries(b.members)
-              .map(([n, m]) => `${n}: ${m.status} (${m.sessionID})`).join("\n") || "(no members)";
+            const live = async (m) => {
+              if (m.status === "killed" || typeof ctx.session.get !== "function") return m.status;
+              try {
+                const s = await ctx.session.get({ sessionID: m.sessionID });
+                const t = s?.time ?? s?.data?.time ?? {};
+                if (s?.outcome && s.outcome !== "succeeded") return `stopped: ${s.outcome}`;
+                if (t.idle && t.busy && t.idle >= t.busy) { m.status = "waiting (idle)"; return m.status; }
+                return "working";
+              } catch { return m.status; }
+            };
+            const roster = (await Promise.all(Object.entries(b.members).map(async ([n, m]) => `${n}: ${await live(m)} (${m.sessionID})`))).join("\n") || "(no members)";
             return { content: `swarm '${b.title}' — head #${b.seq}\ncoordinator: ${h.coordID}\n${roster}\nopen_board: none (board is text; use read_board)` };
           }
           if (args.action === "kill") {

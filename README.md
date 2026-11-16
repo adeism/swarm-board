@@ -26,8 +26,8 @@ Copy-Item skills\swarm           $env:USERPROFILE\.config\opencode\skills\ -Recu
 ```
 
 No `opencode.json` entry needed — `~/.config/opencode/plugins/` is
-auto-discovered and hot-reloads. Verify with
-`Select-String loading\ plugin swarm-board` on `~/.local/share/opencode/log/opencode.log`,
+auto-discovered and hot-reloads. Confirm with
+`Select-String -Path ~/.local/share/opencode/log/opencode.log -Pattern 'id=swarm-board'`,
 or just run `@swarm`.
 
 ## How it works
@@ -41,13 +41,14 @@ your session (coordinator)          board = append-log with seq numbers
 
 - **Workers are real OpenCode sessions** (`session.create`) — own conversation,
   own context window, own tools. 3 workers ≠ sharing the coordinator's window.
-- **`@mentions wake sessions.** A post naming a sleeping member resolves its
+- **`@mentions` wake sessions.** A post naming a sleeping member resolves its
   parked `swarm_wait` or re-prompts it if it ended its turn. `@all` wakes
   everyone; `@coordinator` wakes the coordinator.
 - **Parked = free.** A waiting session sends no requests (0 tokens). Waking
   re-sends its history (prefill cost, not money — relevant on local servers).
 - **State persists** to `~/.local/share/opencode/swarm-board.json`
-  (one board per coordinator session; survives server restarts).
+  (one board per coordinator session). Posts survive a server restart; worker
+  sessions do not resume on their own — post `@name` to revive one.
 
 ## Tools
 
@@ -70,34 +71,54 @@ post rules and asks on the board, park in `swarm_wait`, verify, `kill`, report.
 Handoff etiquette (what makes the graph non-star-shaped):
 
 ```
-@lexer API yang kamu butuh ada di src/api.rs:40
-@verifier hasil ada di #12, audit ya
-@coordinator [done] parser hijau, 142/142 test lulus
+@lexer the API you need is at src/api.rs:40
+@verifier the result is in #12 — audit it
+@coordinator [done] parser green, 142/142 tests pass
 ```
 
 Mention only whoever acts next; reference posts by `#seq` instead of
 copy-pasting reports (keeps the coordinator's context small).
 
-## Real transcript (run on a local 262 K model)
+## Real transcript (fresh run, local 262 K model, English briefs)
 
 ```
-> swarm add   { name: "penulis",   brief: "buat stats.js …" }
-  #4 @penulis added on session ses_e1cb47…
-  #6 penulis:    @pemeriksa [siap] stats.js sudah ada      ← peer→peer wake
-  #7 penulis:    @coordinator [done] penulis: stats.js ditulis
-  #8 pemeriksa:  @penulis [setuju] output asli node check.js: 7/7 LULUS
-  #9 pemeriksa:  @coordinator [done] QA lulus, check.js hijau
-> post_message { text: "@penulis [fase-2] tambahkan modus() …" }
-  #13 penulis:   @coordinator [done] fase-2 modus() …      ← [done]-worker woke again
+> swarm add {name:"builder", brief:"write slug.js to spec …"}     #15 @builder added
+> swarm add {name:"checker", brief:"QA: wait to be mentioned …"}  #16 @checker added
+
+  builder writes slug.js … then stops without posting. Its post_message call
+  came out as literal XML text, so nothing reached the board.
+
+> swarm status        → builder: waiting (idle)        ← live session state
+> post_message "@builder you skipped the protocol …"   #17   (wakes the idle worker;
+                                                              local model flubs again)
+> post_message "@checker file exists, start now …"     #18
+    checker writes check.js (node:assert), runs `node check.js`:
+  #19 checker: @builder [approved] ALL PASS: 7/7 spec assertions green
+  #20 checker: @coordinator [done] QA green, slug.js untouched.
+
+  coordinator's own node asserts (not a console round-trip): 7/7 PASS
+  swarm kill ×2 → builder, checker terminated
 ```
 
-Phase 2 is the point: a worker that had already posted `[done]` was woken by a
-mention alone — impossible for a plain one-shot subagent. The coordinator spent
-a few hundred tokens of its own window while both workers did the real work in
-theirs.
+Earlier run, same plugin (`stats.js`, Indonesian briefs):
+
+```
+  #11 coordinator: @penulis [fase-2] add modus() …   ← worker had already posted [done]
+  #13 penulis:     @coordinator [done] fase-2 …      ← woke from the mention, did phase 2
+```
+
+What both runs prove: the board routes wakes (`@mention` → parked or idle session),
+workers do the real work in their own windows, and the coordinator can verify
+with first-party evidence (its own tests, not a worker's claims). What failed in
+run two is the local model's tool-calling, not the board — see Limitations.
 
 ## Limitations (deliberately small)
 
+- Local models occasionally print a tool call as **literal XML text** instead of
+  invoking the tool (observed live: a worker "reported" a post that never
+  existed). Nothing is posted and the session goes idle — `swarm status` now
+  reads live session state (`waiting (idle)` vs `working`), so nudge `@name`
+  or kill/replace. Trust raw test output, never a worker's claim.
 - No channels, `fork:`, `workspace:"share"` worktrees, batched `n`/`tasks`
   adds, per-provider quota in `models`, Swarm-UI panel / graph view
   (`status` answers `open_board: none`; the edge data lives in the state JSON
