@@ -12,7 +12,8 @@ plugin that registers those four tools and runs the board.
 
 Tier 1 autopilot is included: live-state reconciliation, a `[done]/[blocked]/[stall]`
 marker state machine, a built-in `[stall]` monitor, and auto-heal for local
-models that print tool calls as text.
+models that print tool calls as text. Tier 2 adds channels and a static local
+board UI (Board / Members / Graph) with no server and no extra dependency.
 
 | Repo file | Goes to (global OpenCode config dir) |
 |---|---|
@@ -48,6 +49,9 @@ your session (coordinator)          board = append-log with seq numbers
 - **`@mentions` wake sessions.** A post naming a sleeping member resolves its
   parked `swarm_wait` or re-prompts it if it ended its turn. `@all` wakes
   everyone; `@coordinator` wakes the coordinator.
+- **Channels split attention, not access.** `#main` carries cross-area traffic;
+  `@#parser` wakes only workers subscribed to `#parser`. See
+  [Channels](#channels).
 - **Parked = free.** A waiting session sends no requests (0 tokens). Waking
   re-sends its history (prefill cost, not money — relevant on local servers).
 - **State persists** to `~/.local/share/opencode/swarm-board.json`
@@ -61,13 +65,87 @@ your session (coordinator)          board = append-log with seq numbers
 
 | Tool | Call |
 |---|---|
-| `swarm` | `{action:"add", name:"parser", brief:"…"}` · `{action:"status"}` (live state, quiet time, heal count) · `{action:"kill", name}` · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (best effort, untested on this build) |
-| `post_message` | `{text:"@verifier check #4"}` — mention = wake |
-| `read_board` | `{since: 12}` — posts newer than a seq |
-| `swarm_wait` | `{since: 12}` — sleeps until the board moves (60 s cap) |
+| `swarm` | `{action:"add", name:"parser", brief:"…", channels:["parser"]}` · `{action:"status"}` (roster incl. channels, quiet time, heal count, `open_board` URL) · `{action:"channel", op:"create"\|"subscribe"\|"unsubscribe"\|"list"\|"archive", channel, topic?, name?}` · `{action:"kill", name}` · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (best effort, untested on this build) |
+| `post_message` | `{text:"@verifier check #4", channel:"parser"}` — mention = wake; `channel` defaults to your work channel |
+| `read_board` | `{since:12}` (your view) · `{since:12, channel:"parser"}` (one channel) · `{channel:"*"}` (everything) |
+| `swarm_wait` | `{since:12}` — waits for your name / `@all` / `@#your-channel`; `{mentions_only:false}` also wakes for plain posts in your channels (60 s cap) |
 
 Worker names: lowercase `[a-z0-9-]`; `all` / `coordinator` are reserved; killed
-names cannot be reused.
+names cannot be reused. Channel names use the same pattern, except `main`.
+
+## Channels
+
+A board starts as one channel, `#main`. Channels keep area chatter out of the
+other areas' inboxes. They are an attention filter, not an access-control
+boundary: the state file and UI are local and show every channel.
+
+- **Create, then assign.** `swarm{action:"channel", op:"create", channel:"parser",
+  topic:"lexer and parser"}`, then `swarm{action:"add", name:"lexer", brief:"…",
+  channels:["parser"]}`. The brief is posted in the worker's first channel, which
+  is also where its `post_message` goes by default. A helper added by a worker
+  inherits the adder's channels unless `channels` says otherwise.
+- **Move with `subscribe` / `unsubscribe`** (`channel` + `name`). The coordinator
+  may move any worker; a worker may move itself and the helpers it added. A new
+  subscription changes where future `@#channel` calls wake it; `read_board` still
+  returns the channel's full history.
+- **`list`** shows each channel's topic, creator and subscribers; **`archive`**
+  stops new posts but keeps history readable. `status` shows every member's
+  channels.
+- **Default views.** A member sees `#main` plus its subscriptions; the
+  coordinator and a worker named `monitor` see every channel. An explicit
+  `read_board{channel:"parser"}` can read any existing channel, and
+  `channel:"*"` reads everything; subscriptions shape the default view and
+  wakes, not secrecy.
+- **`@name` crosses channels.** `@all` is still everyone. `@#parser` wakes every
+  subscriber of `#parser` (and the coordinator) from any channel, including
+  workers waiting for mentions only. `@#main` is refused (that is `@all`); an
+  unknown or archived channel wakes nobody.
+- **Waiters.** A member wakes for its own name, `@all`, or `@#` of a channel it
+  joined. `swarm_wait{mentions_only:false}` also wakes for plain posts in the
+  member's channels. The coordinator waits on every post.
+
+## Board UI (Tier 2, static)
+
+Posts, ticks and `status` refresh one self-contained HTML file:
+
+```
+~/.local/share/opencode/swarm-board/<coordinator-session>.html
+```
+
+`swarm{action:"status"}` returns it as `open_board: file:///…`. Open it in any
+browser; there is no server, no network request and no dependency (the file is
+written only when the snapshot changes).
+
+- **Board** — newest first, channel filter and text filter (kept in
+  `sessionStorage`), `[done]` / `[blocked]` badges.
+- **Members** — coordinator plus live state, marker, heal count, channels and
+  session id; the session column is hidden below 640 px.
+- **Graph** — SVG mention graph from the last 200 posts (solid = `@name`,
+  dashed = `@#channel`).
+- Auto-reload every 3 s. The active tab is in the URL hash and filters survive
+  the reload; while a filter input is focused, the reload waits.
+- Board text is inserted with `textContent`; the embedded JSON escapes `<`, so a
+  post containing `</script>` cannot break out.
+- Read-only snapshot: no buttons, no live socket, no narrator. It shows all
+  channels, including archived ones.
+
+Tier 2 live check (same server, 2026-11-16):
+
+```
+#28 coordinator → #alpha          post_message{channel:"alpha"}
+#30 @scout added on #alpha        add{channels:["alpha"]}; brief landed in #alpha
+#31 scout → #alpha                member default post; @coordinator [done]
+#32 coordinator → #main           "@#alpha second ping"
+#33 scout → #alpha                woken by @#alpha, not @all; [done]
+    status → scout: waiting (idle) [done] [heals 1/2] [#main #alpha]
+    open_board → file:///…/ses_….html
+
+UI in Chromium: 33 posts, 10 members, 4 channels, 0 console errors;
+    channel filter #alpha → 4/33, text filter "scout" → 3/33; Members and
+    Graph tabs render. scout needed one auto-heal before it posted.
+#beta / #gamma archived: posting rejected, read_board history still works;
+    @#main refused; posting to an unknown channel rejected.
+```
 
 ## Usage
 
@@ -161,11 +239,16 @@ run two is the local model's tool-calling, not the board — see Limitations.
   2 correction prompts; if the model still refuses, the member shows
   `needs help (heal cap)` — nudge `@name` or kill/replace. Trust raw test output,
   never a worker's claim.
-- No channels, `fork:`, `workspace:"share"` worktrees, batched `n`/`tasks`
-  adds, per-provider quota in `models`, Swarm-UI panel / graph view
-  (`status` answers `open_board: none`; the edge data lives in the state JSON
-  if you want to draw it). Narrator is a normal worker; the stall monitor is
-  built into the plugin (no `swarm_monitor` skill/worker needed).
+- No `fork:`, `workspace:"share"` worktrees, batched `n`/`tasks` adds, or
+  per-provider quota in `models`. The stall monitor is built into the plugin
+  (no `swarm_monitor` skill/worker needed).
+- No narrator (`swarm_narrator`): its upstream UI/protocol is not shipped here.
+  A narrator worker would be a normal member; the static UI covers the overview.
+- The UI is a read-only static file that reloads every 3 s: no streaming, no
+  buttons, no history beyond the 500-post cap. It shows every channel. Channels
+  reduce wakes; they are not an access-control boundary.
+- `read_board{channel}` is explicit and unrestricted by subscription;
+  subscriptions only decide the default view and which `@#` calls wake a member.
 - `swarm_wait` caps at 60 s per call (safe under harness tool timeouts) —
   call it in a loop; each park is still free.
 - Board history is capped at 500 posts.
