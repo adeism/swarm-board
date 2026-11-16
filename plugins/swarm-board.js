@@ -1,6 +1,8 @@
 // swarm-board: board tools for the `swarm` skill (swarm, post_message, read_board, swarm_wait).
 // Pure V2 plugin (same shape as @dietrichgebert/ponytail): no external deps.
 // Workers are real OpenCode sessions; the board is an append-log woken by @mentions.
+// Tier 1: 15 s live-state reconcile, [done]/[blocked]/[stall] markers, built-in
+//   stall monitor, and auto-heal for tool calls printed as text.
 // shortcut: single board per coordinator session; no channels/fork/workspace/model-switch
 //   semantics yet, no `n`/`tasks` batched add. Add them when the swarm actually needs them.
 
@@ -10,6 +12,9 @@ import os from "node:os";
 
 const FILE = path.join(os.homedir(), ".local", "share", "opencode", "swarm-board.json");
 const WAIT_TIMEOUT_MS = 60_000;
+const STALL_MS = 180_000;   // board quiet this long with live members => monitor [stall]
+const TICK_MS = 15_000;     // reconcile live session state + heal pseudo tool calls
+const HEAL_CAP = 2;         // max auto-heal prompts per worker session
 
 let db = { swarms: {}, memberIndex: {} };
 try { db = JSON.parse(fs.readFileSync(FILE, "utf8")); } catch { /* fresh board */ }
@@ -34,6 +39,21 @@ function mentionedNames(board, text) {
   return set;
 }
 
+function markerOf(text) {
+  const m = /\[(done|blocked|stall)\]/i.exec(String(text ?? ""));
+  return m ? m[1].toLowerCase() : null;
+}
+
+// The local-model failure we hit live: a tool call printed as literal XML text.
+function looksLikePseudoToolCall(text) {
+  return /<\s*\/?\s*tool_call\b|<\s*function\s*=|<\s*parameter\s*=/i.test(String(text ?? ""));
+}
+
+function idleNow(s) {
+  const t = s?.time ?? s?.data?.time ?? {};
+  return Boolean(t.idle && t.busy && t.idle >= t.busy);
+}
+
 function deliver(coordID, post) {
   const board = db.swarms[coordID];
   if (!board) return;
@@ -42,7 +62,7 @@ function deliver(coordID, post) {
     const parked = waiters.filter((w) => w.coordID === coordID && w.sessionID === sessionID);
     if (parked.length) { for (const w of parked.splice(0)) w.resolve(post); return; }
     const member = Object.values(board.members).find((m) => m.sessionID === sessionID);
-    if (member) member.status = "working";
+    if (member) { member.status = "working"; member.marker = null; }
     ctx.session.prompt({ sessionID, text:
       `[swarm '${board.title}' board, head #${board.seq}] ${post.text}\n` +
       `Act on it if it is for you; reply on the board via post_message to '@${post.from} ...' ` +
@@ -74,9 +94,137 @@ function post(coordID, from, text) {
   const p = { seq: board.seq, from, text, at: new Date().toISOString() };
   board.posts.push(p);
   board.posts = board.posts.slice(-500); // shortcut: cap history at 500; prune to file when it hurts
+  const marker = markerOf(text);
+  const member = from !== "coordinator" && from !== "monitor" ? board.members[from] : null;
+  if (member && marker) { member.marker = marker; member.markerAt = p.at; }
+  if (from !== "monitor") board.stalls = 0; // a human/agent reply restarts the stall window
   save();
   deliver(coordID, p);
   return p;
+}
+
+// Reconcile one member with its live session. Marker labels survive; stale
+// "working" becomes "waiting (idle)"; an idle session that printed a tool call
+// as text gets one correction prompt per idle transition (HEAL_CAP overall).
+async function reconcileMember(m) {
+  if (!ctx || m.status === "killed" || typeof ctx.session?.get !== "function") return;
+  let s;
+  try { s = await ctx.session.get({ sessionID: m.sessionID }); } catch { return; }
+  const outcome = s?.outcome ?? s?.data?.outcome;
+  if (outcome && outcome !== "succeeded") {
+    m.status = `stopped: ${outcome}`;
+    save();
+    return;
+  }
+  if (!idleNow(s)) {
+    m.status = "working";
+    save();
+    return;
+  }
+  m.status = "waiting (idle)";
+  save();
+  if (m.marker) return; // [done]/[blocked]/[stall] already answers "why idle"
+  const idle = (s.time ?? s.data.time).idle;
+  if ((m.heals ?? 0) >= HEAL_CAP) {
+    if (m.healMsgID) { m.status = "needs help (heal cap)"; save(); }
+    return;
+  }
+  if (m.idleChecked === idle) return;
+  m.idleChecked = idle;
+  await healMember(m);
+}
+
+async function healMember(m) {
+  if (typeof ctx.session?.context !== "function") return;
+  let msgs;
+  try { msgs = await ctx.session.context({ sessionID: m.sessionID }); } catch { return; }
+  if (!Array.isArray(msgs) || msgs.at(-1)?.type !== "idle") return;
+  const last = [...msgs].reverse().find((x) => x.type === "assistant");
+  if (!last || m.healMsgID === last.id) return;
+  const text = (last.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+  if (!looksLikePseudoToolCall(text)) return;
+  m.healMsgID = last.id;
+  m.heals = (m.heals ?? 0) + 1;
+  m.status = "working";
+  save();
+  await ctx.session.prompt({ sessionID: m.sessionID, text:
+    `[swarm monitor] Auto-heal ${m.heals}/${HEAL_CAP}: your last message printed a tool call as text ` +
+    `instead of invoking the tool. Do not write XML. Invoke your normal tool interface now ` +
+    `(in Code Mode: execute with tools.post_message), then end your turn.` }).catch((e) => {
+      m.status = "stopped: " + String(e?.message ?? e).slice(0, 120);
+      save();
+    });
+}
+
+async function stallCheck(coordID) {
+  const b = db.swarms[coordID];
+  if (!b) return;
+  // A worker-based monitor (swarm_monitor skill) replaces the built-in one.
+  if (Object.entries(b.members).some(([n, m]) => /^monitor(-\d+)?$/.test(n) && m.status !== "killed")) return;
+  const last = b.posts.at(-1);
+  if (!last || last.from === "monitor") return;
+  if (Date.now() - Date.parse(last.at) < STALL_MS) return;
+  const pending = Object.entries(b.members)
+    .filter(([, m]) => m.status !== "killed" && !String(m.status).startsWith("stopped")
+      && !["done", "blocked"].includes(m.marker))
+    .map(([n]) => n);
+  if (!pending.length) return;
+  if ((b.stalls ?? 0) >= 3) return; // shortcut: at most 3 auto-stalls per quiet period
+  if (!waiters.some((w) => w.coordID === coordID)) {
+    try { if (!idleNow(await ctx.session.get({ sessionID: coordID }))) return; } catch {}
+  }
+  b.stalls = (b.stalls ?? 0) + 1;
+  save();
+  const quiet = Date.now() - Date.parse(last.at);
+  const howLong = quiet >= 60_000 ? `${Math.round(quiet / 60_000)}m` : `${Math.round(quiet / 1000)}s`;
+  post(coordID, "monitor", `@coordinator [stall] quiet ${howLong} since #${last.seq} (${last.from}); ` +
+    `silent: ${pending.join(", ")}. Hand out the next step or unblock.`);
+}
+
+let ticking = false;
+async function tick() {
+  if (!ctx || ticking) return;
+  ticking = true;
+  try {
+    for (const [coordID, b] of Object.entries(db.swarms)) {
+      for (const [name, m] of Object.entries(b.members ?? {})) {
+        try { await reconcileMember(m); } catch {}
+      }
+      for (let i = waiters.length - 1; i >= 0; i--) {
+        const w = waiters[i];
+        if (w.coordID !== coordID) continue;
+        const dead = Object.values(b.members ?? {}).some((m) => m.sessionID === w.sessionID && m.status === "killed");
+        if (dead) waiters.splice(i, 1)[0].resolve({ content: "(session killed while waiting)" });
+      }
+      try { await stallCheck(coordID); } catch {}
+    }
+  } finally { ticking = false; }
+}
+
+function onEvent(ev) {
+  if (!/session\.(step\.(ended|failed)|idle|error)/i.test(String(ev?.type ?? ""))) return;
+  const sid = ev?.data?.sessionID;
+  const idx = sid && db.memberIndex[sid];
+  const m = idx && db.swarms[idx.coordID]?.members?.[idx.name];
+  if (m) reconcileMember(m).catch(() => {});
+}
+
+function startEngine() {
+  const g = globalThis;
+  g.__swarmBoardOnEvent = onEvent;
+  if (g.__swarmBoardEventLoop !== true && typeof ctx.event?.subscribe === "function") {
+    g.__swarmBoardEventLoop = true;
+    (async () => {
+      try {
+        for await (const ev of ctx.event.subscribe()) {
+          try { g.__swarmBoardOnEvent?.(ev); } catch {}
+        }
+      } catch { /* stream closed */ } finally { g.__swarmBoardEventLoop = false; }
+    })();
+  }
+  if (g.__swarmBoardTicker) clearInterval(g.__swarmBoardTicker);
+  g.__swarmBoardTicker = setInterval(() => { tick().catch(() => {}); }, TICK_MS);
+  g.__swarmBoardTicker.unref?.();
 }
 
 const WORKER_RULES = (name, title, seq) =>
@@ -147,18 +295,13 @@ export default {
             const h = boardFor(sessionID);
             if (!h) throw new Error("no swarm for this session; swarm{action:'add'} or 'title' first");
             const b = h.board;
-            const live = async (m) => {
-              if (m.status === "killed" || typeof ctx.session.get !== "function") return m.status;
-              try {
-                const s = await ctx.session.get({ sessionID: m.sessionID });
-                const t = s?.time ?? s?.data?.time ?? {};
-                if (s?.outcome && s.outcome !== "succeeded") return `stopped: ${s.outcome}`;
-                if (t.idle && t.busy && t.idle >= t.busy) { m.status = "waiting (idle)"; return m.status; }
-                return "working";
-              } catch { return m.status; }
-            };
-            const roster = (await Promise.all(Object.entries(b.members).map(async ([n, m]) => `${n}: ${await live(m)} (${m.sessionID})`))).join("\n") || "(no members)";
-            return { content: `swarm '${b.title}' — head #${b.seq}\ncoordinator: ${h.coordID}\n${roster}\nopen_board: none (board is text; use read_board)` };
+            await Promise.all(Object.entries(b.members).map(([, m]) =>
+              reconcileMember(m).catch(() => {})));
+            const roster = Object.entries(b.members)
+              .map(([n, m]) => `${n}: ${m.status}${m.marker ? ` [${m.marker}]` : ""}${m.heals ? ` [heals ${m.heals}/${HEAL_CAP}]` : ""} (${m.sessionID})`)
+              .join("\n") || "(no members)";
+            const quiet = b.posts.at(-1) ? Math.round((Date.now() - Date.parse(b.posts.at(-1).at)) / 1000) : 0;
+            return { content: `swarm '${b.title}' — head #${b.seq} (quiet ${quiet}s)\ncoordinator: ${h.coordID}\n${roster}\nopen_board: none (board is text; use read_board)` };
           }
           if (args.action === "kill") {
             const h = boardFor(sessionID);
@@ -262,5 +405,9 @@ export default {
         },
       });
     });
+    startEngine();
   },
 };
+
+// Deterministic bits for tests; the plugin loader only reads `default`.
+export const _pure = { mentionedNames, markerOf, looksLikePseudoToolCall, idleNow };

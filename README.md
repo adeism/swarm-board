@@ -10,6 +10,10 @@ tools (`swarm`, `post_message`, `read_board`, `swarm_wait`) simply do not
 exist. This repo adds the missing half: a zero-dependency OpenCode server
 plugin that registers those four tools and runs the board.
 
+Tier 1 autopilot is included: live-state reconciliation, a `[done]/[blocked]/[stall]`
+marker state machine, a built-in `[stall]` monitor, and auto-heal for local
+models that print tool calls as text.
+
 | Repo file | Goes to (global OpenCode config dir) |
 |---|---|
 | `plugins/swarm-board.js` | `~/.config/opencode/plugins/swarm-board.js` |
@@ -49,12 +53,15 @@ your session (coordinator)          board = append-log with seq numbers
 - **State persists** to `~/.local/share/opencode/swarm-board.json`
   (one board per coordinator session). Posts survive a server restart; worker
   sessions do not resume on their own — post `@name` to revive one.
+- **The plugin is also the monitor.** A 15 s tick reconciles live session
+  state, applies `[done]/[blocked]/[stall]` markers, and posts a `[stall]`
+  notice after 3 quiet minutes — see [Autopilot](#autopilot-tier-1).
 
 ## Tools
 
 | Tool | Call |
 |---|---|
-| `swarm` | `{action:"add", name:"parser", brief:"…"}` · `{action:"status"}` (live session state) · `{action:"kill", name}` · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (best effort, untested on this build) |
+| `swarm` | `{action:"add", name:"parser", brief:"…"}` · `{action:"status"}` (live state, quiet time, heal count) · `{action:"kill", name}` · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (best effort, untested on this build) |
 | `post_message` | `{text:"@verifier check #4"}` — mention = wake |
 | `read_board` | `{since: 12}` — posts newer than a seq |
 | `swarm_wait` | `{since: 12}` — sleeps until the board moves (60 s cap) |
@@ -78,6 +85,41 @@ Handoff etiquette (what makes the graph non-star-shaped):
 
 Mention only whoever acts next; reference posts by `#seq` instead of
 copy-pasting reports (keeps the coordinator's context small).
+
+## Autopilot (Tier 1)
+
+The plugin keeps the board honest without the coordinator polling:
+
+| Behavior | What happens |
+|---|---|
+| State reconciliation | Every 15 s, and on `session.step.ended` / `session.error` events, each member's live session is checked. Idle workers flip from `working` to `waiting (idle)`; session errors become `stopped: …`. |
+| Marker state machine | A member post containing `[done]`, `[blocked]` or `[stall]` records that marker beside the live state (`waiting (idle) [done]`), so the upstream skill still sees the word `waiting` and finished members stop counting as pending. |
+| Built-in stall monitor | If the board is quiet for 3 min, workers are still pending, and the coordinator is parked or idle, the plugin posts `@coordinator [stall] quiet … silent: …` from `monitor`. That post resolves a parked `swarm_wait` immediately. Capped at 3 consecutive stalls; any non-monitor post resets the window. |
+| Auto-heal | An idle worker whose last text looks like a literal tool call (`<tool_call>`, `<function=…>`) gets one correction prompt per idle transition, max 2 per session; then `needs help (heal cap)`. |
+
+A worker named `monitor` (or `monitor-N`) disables the built-in stall posts, so
+a custom `swarm_monitor` worker can take over. This repo intentionally does
+**not** ship `swarm_monitor`: a parked worker cannot run a timer, so the plugin
+*is* the monitor. The upstream skill skips its monitor step when that skill is
+not installed.
+
+Live checks on the same server (2026-11-16):
+
+```
+#27 marker2: @coordinator [done] marker2: state machine re-check
+    swarm status → marker2: waiting (idle) [done] [heals 2/2]
+    (auto-heal: this worker also emitted tool-call XML twice; cap enforced,
+    correction prompts visible in its session history)
+
+#24 monitor: @coordinator [stall] quiet 1m since #23 (coordinator); silent: sleepy
+    posted while the coordinator was parked in swarm_wait; the wait returned
+    this exact post — no polling
+
+state file, read without calling status:
+    idler: working → waiting (idle)   ← 15 s tick / event reconcile
+```
+
+The stall check ran with a temporary 10 s threshold; production is 3 min.
 
 ## Real transcript (fresh run, local 262 K model, English briefs)
 
@@ -115,14 +157,15 @@ run two is the local model's tool-calling, not the board — see Limitations.
 ## Limitations (deliberately small)
 
 - Local models occasionally print a tool call as **literal XML text** instead of
-  invoking the tool (observed live: a worker "reported" a post that never
-  existed). Nothing is posted and the session goes idle — `swarm status` now
-  reads live session state (`waiting (idle)` vs `working`), so nudge `@name`
-  or kill/replace. Trust raw test output, never a worker's claim.
+  invoking the tool. Tier 1 detects it when the worker goes idle and sends up to
+  2 correction prompts; if the model still refuses, the member shows
+  `needs help (heal cap)` — nudge `@name` or kill/replace. Trust raw test output,
+  never a worker's claim.
 - No channels, `fork:`, `workspace:"share"` worktrees, batched `n`/`tasks`
   adds, per-provider quota in `models`, Swarm-UI panel / graph view
   (`status` answers `open_board: none`; the edge data lives in the state JSON
-  if you want to draw it). Narrator/monitor are just normal workers.
+  if you want to draw it). Narrator is a normal worker; the stall monitor is
+  built into the plugin (no `swarm_monitor` skill/worker needed).
 - `swarm_wait` caps at 60 s per call (safe under harness tool timeouts) —
   call it in a loop; each park is still free.
 - Board history is capped at 500 posts.
