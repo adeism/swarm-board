@@ -4,9 +4,8 @@
 // Tier 1: 15 s live-state reconcile, [done]/[blocked]/[stall] markers, built-in
 //   stall monitor, and auto-heal for tool calls printed as text.
 // Tier 2: channels (#main + area channels) and a static local board UI.
-// shortcut: one board per coordinator session; no fork/workspace/model-switch
-//   semantics yet, no `n`/`tasks` batched add, no narrator. Add them when the
-//   swarm actually needs them.
+// V2 APIs: 15 s tick + session.* execution events, session.get/context,
+// session.fork/switchModel available; no fork/workspace UI semantics yet.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -26,6 +25,7 @@ let db = { swarms: {}, memberIndex: {} };
 try { db = JSON.parse(fs.readFileSync(FILE, "utf8")); } catch { /* fresh board */ }
 db.swarms ??= {};
 db.memberIndex ??= {};
+db.retired ??= {};
 
 // Two plugin instances coexist across a hot reload, each with its own db. The
 // board with the higher seq is the truth: adopt it and never write a stale
@@ -41,8 +41,17 @@ function newerBoards(disk, mem) {
 function adoptNewer() {
   let disk;
   try { disk = JSON.parse(fs.readFileSync(FILE, "utf8")); } catch { return; }
-  for (const [id, b] of Object.entries(newerBoards(disk, db))) db.swarms[id] = b;
+  // A cleanup writes tombstones so a stale instance cannot resurrect a board
+  // it still holds in memory (two instances reload on every plugin save).
+  db.retired = { ...(disk?.retired ?? {}), ...(db.retired ?? {}) };
+  for (const [id, b] of Object.entries(newerBoards(disk, db))) {
+    if (!db.retired[id]) db.swarms[id] = b;
+  }
+  for (const id of Object.keys(db.swarms)) if (db.retired[id]) delete db.swarms[id];
   db.memberIndex = { ...(disk?.memberIndex ?? {}), ...db.memberIndex };
+  for (const [sid, rec] of Object.entries(db.memberIndex)) {
+    if (!db.swarms[rec.coordID]) delete db.memberIndex[sid];
+  }
 }
 
 const save = () => { try { adoptNewer(); fs.writeFileSync(FILE, JSON.stringify(db)); } catch {} };
@@ -164,6 +173,52 @@ function markerOf(text) {
   return m ? m[1].toLowerCase() : null;
 }
 
+// V2 session events that move board state. The old regex matched names that do
+// not exist in this build (`session.error`) and missed execution failures.
+const EVENT_ACTION = {
+  "session.step.ended": "reconcile",
+  "session.step.failed": "reconcile",
+  "session.execution.succeeded": "reconcile",
+  "session.execution.failed": "error",
+  "session.execution.interrupted": "reconcile",
+  "session.idle": "reconcile",
+  "session.model.selected": "model",
+  "session.deleted": "deleted",
+};
+function eventAction(ev) {
+  return EVENT_ACTION[String(ev?.type ?? "")] ?? null;
+}
+function eventError(ev) {
+  const e = ev?.data?.error;
+  if (!e) return "";
+  const msg = String(e.message ?? e.type ?? "error");
+  const retry = Number(e.retryAfterMs) > 0 ? ` retry ${Math.round(e.retryAfterMs / 1000)}s` : "";
+  return `${e.type ?? "error"}: ${msg}${retry}`.slice(0, 120);
+}
+function modelFrom(s) {
+  const md = (s?.data ?? s)?.model;
+  return md && md.id ? [md.providerID, md.id].filter(Boolean).join("/") : "";
+}
+
+function isRetiredMember(m) {
+  return m.status === "killed" || String(m.status).startsWith("stopped")
+    || ["done", "blocked"].includes(m.marker);
+}
+
+// A killed/done worker session has no further use. OpenCode keeps it in the
+// session list forever unless we remove it, which is what clutters the UI.
+async function retireWorkerSession(name, m) {
+  if (!m?.sessionID) return false;
+  let ok = false;
+  try {
+    await ctx.session.interrupt?.({ sessionID: m.sessionID, resume: false });
+    await ctx.session.remove?.({ sessionID: m.sessionID });
+    ok = true;
+  } catch { /* already gone or unsupported */ }
+  delete db.memberIndex[m.sessionID];
+  return ok;
+}
+
 // The local-model failure we hit live: a tool call printed as literal XML text.
 function looksLikePseudoToolCall(text) {
   return /<\s*\/?\s*tool_call\b|<\s*function\s*=|<\s*parameter\s*=/i.test(String(text ?? ""));
@@ -203,6 +258,10 @@ function deliver(coordID, post) {
     waiters.splice(i, 1)[0].resolve(post);
     resolved.add(w.sessionID);
   }
+  for (const sid of resolved) {
+    const member = Object.values(board.members ?? {}).find((m) => m.sessionID === sid);
+    if (member && member.status !== "killed") { member.status = "working"; member.marker = null; }
+  }
   for (const sid of promptIDs) {
     if (resolved.has(sid)) continue;
     const member = Object.values(board.members ?? {}).find((m) => m.sessionID === sid);
@@ -241,10 +300,15 @@ function post(coordID, from, text, requestedChannel) {
 // Reconcile one member with its live session. Marker labels survive; stale
 // "working" becomes "waiting (idle)"; an idle session that printed a tool call
 // as text gets one correction prompt per idle transition (HEAL_CAP overall).
-async function reconcileMember(m) {
+// `forcedError` comes from an execution.failed event, which carries the reason
+// that `session.get` may no longer report.
+async function reconcileMember(m, forcedError) {
   if (!ctx || m.status === "killed" || typeof ctx.session?.get !== "function") return;
+  if (forcedError) { m.status = `stopped: ${forcedError}`; save(); return; }
   let s;
   try { s = await ctx.session.get({ sessionID: m.sessionID }); } catch { return; }
+  const md = modelFrom(s);
+  if (md && md !== m.model) m.model = md;
   const outcome = s?.outcome ?? s?.data?.outcome;
   if (outcome && outcome !== "succeeded") {
     m.status = `stopped: ${outcome}`;
@@ -316,6 +380,26 @@ async function stallCheck(coordID) {
     `silent: ${pending.join(", ")}. Hand out the next step or unblock.`);
 }
 
+async function modelOf(sid) {
+  if (typeof ctx?.session?.get === "function") {
+    try {
+      const s = await ctx.session.get({ sessionID: sid });
+      const md = (s?.data ?? s)?.model;
+      if (md && md.id) return [md.providerID, md.id].filter(Boolean).join("/");
+    } catch {}
+  }
+  if (typeof ctx?.session?.context !== "function") return "";
+  try {
+    const r = await ctx.session.context({ sessionID: sid });
+    const arr = Array.isArray(r) ? r : (Array.isArray(r?.data) ? r.data : []);
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const md = arr[i]?.model;
+      if (md && md.id) return [md.providerID, md.id].filter(Boolean).join("/");
+    }
+  } catch {}
+  return "";
+}
+
 function boardSnapshot(coordID, b) {
   const members = Object.entries(b.members ?? {}).map(([name, m]) => ({
     name,
@@ -323,6 +407,7 @@ function boardSnapshot(coordID, b) {
     marker: m.marker ?? null,
     heals: m.heals ?? 0,
     sessionID: m.sessionID,
+    model: m.model ?? "",
     channels: ["main", ...(Array.isArray(m.channels) ? m.channels : [])],
     addedBy: m.addedBy ?? null,
   }));
@@ -338,9 +423,11 @@ function boardSnapshot(coordID, b) {
     coordID,
     title: b.title ?? "the swarm",
     seq: b.seq ?? 0,
-    posts: (b.posts ?? []).map((p) => ({ ...p, channel: channelOf(p) })),
+    posts: (b.posts ?? []).map((p) => ({ ...p, channel: channelOf(p),
+      model: p.from === "coordinator" ? (b.coordModel ?? "") : (b.members?.[p.from]?.model ?? "") })),
     members,
     channels,
+    coordModel: b.coordModel ?? "",
   };
 }
 
@@ -357,58 +444,64 @@ function renderBoardHtml(coordID, b) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
-<title>swarm board</title>
+<title>swarm://board</title>
 <style>
 *{box-sizing:border-box}
-:root{--bg:#f5f7fb;--panel:#fff;--ink:#0f172a;--muted:#64748b;--line:#dbe3ee;--accent:#2563eb;--soft:#eef2ff}
-@media(prefers-color-scheme:dark){:root{--bg:#0b1220;--panel:#111c31;--ink:#e2e8f0;--muted:#94a3b8;--line:#24324a;--accent:#60a5fa;--soft:#172554}}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
-header{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--line);padding:12px 20px 0}
+:root{--bg:#050805;--panel:#0a120c;--ink:#00ff41;--muted:#3f7a4d;--line:#123c1c;--accent:#00ff41;--soft:#0c1e11;--amber:#ffd166;--red:#ff5d73;--cyan:#4dd0c0}
+html{background:var(--bg)}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 "Courier New",ui-monospace,SFMono-Regular,Consolas,monospace}
+header{position:sticky;top:0;z-index:2;background:rgba(5,8,5,.97);border-bottom:1px solid var(--line);padding:12px 20px 0}
 .head{display:flex;gap:12px;align-items:baseline;justify-content:space-between;max-width:1000px;margin:0 auto;flex-wrap:wrap}
-h1{font-size:18px;margin:0}
+h1{font-size:16px;margin:0;letter-spacing:.1em;text-transform:uppercase}
 .muted{color:var(--muted);font-size:12px}
-nav{max-width:1000px;margin:10px auto 0;display:flex;gap:4px}
-nav a{padding:8px 14px;color:var(--muted);text-decoration:none;border-radius:8px 8px 0 0;font-weight:600}
-nav a.on{color:var(--accent);background:var(--panel);border:1px solid var(--line);border-bottom-color:var(--panel);margin-bottom:-1px}
+nav{max-width:1000px;margin:10px auto 0;display:flex;gap:18px}
+nav a{padding:6px 2px;color:var(--muted);text-decoration:none;font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:12px;border-bottom:2px solid transparent}
+nav a:hover{color:var(--ink)}
+nav a.on{color:var(--ink);border-bottom-color:var(--accent)}
 main{max-width:1000px;margin:0 auto;padding:20px}
-.controls{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px}
-label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted);font-weight:600}
-select,input{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink);min-width:180px}
+.controls{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px}
+label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+select,input{font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:2px;background:var(--panel);color:var(--ink);min-width:180px;outline:none}
+select:focus,input:focus{border-color:var(--accent)}
 input[type=search]{min-width:240px}
-.post{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:10px;padding:10px 14px;margin-bottom:10px}
+select option{background:#050805;color:var(--ink)}
+.post{background:var(--panel);border:1px solid var(--line);border-left:2px solid var(--accent);padding:9px 12px;margin-bottom:8px}
 .phead{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px}
 .seq{font-weight:700;color:var(--accent)}
-.from{font-weight:700}
+.from{font-weight:700;color:var(--cyan)}
+.model{color:var(--muted);font-size:11px;font-weight:400}
 .time{margin-left:auto}
-.body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:6px}
-.mention{color:var(--accent)}
-.chip{display:inline-block;padding:1px 7px;border-radius:999px;background:var(--soft);font-size:11px;font-weight:600;color:var(--accent)}
-.chip.done{background:#dcfce7;color:#166534}
-.chip.blocked{background:#fee2e2;color:#991b1b}
-.chip.stall{background:#fef3c7;color:#92400e}
+.body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:5px;color:#9fd9ab}
+.mention{color:var(--amber)}
+.chip{display:inline-block;padding:1px 6px;border:1px solid var(--line);border-radius:2px;background:var(--soft);font-size:11px;color:var(--ink)}
+.chip.chan{color:var(--cyan)}
+.chip.done{background:#0b2011;color:#7dff9e;border-color:#1f8f3a}
+.chip.blocked{background:#1f0a0d;color:var(--red);border-color:#8f1f36}
+.chip.stall{background:#1f1a08;color:var(--amber);border-color:#8f701f}
 .empty{padding:40px;text-align:center;color:var(--muted)}
-table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}
 th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top;font-size:13px}
 th:first-child,td:first-child{white-space:nowrap}
-td:last-child{color:var(--muted);font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;word-break:break-all}
-th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+td:last-child{color:var(--muted);font:11px/1.5 "Courier New",monospace;overflow-wrap:anywhere;word-break:break-all}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
 tr:last-child td{border-bottom:0}
-.st{font-weight:600}
-.st-working{color:#b45309}.st-waiting{color:var(--muted)}.st-killed{color:#64748b;text-decoration:line-through}.st-stopped{color:#b91c1c}.st-needs{color:#c2410c}
-tr.killed{opacity:.55}
+.st{font-weight:700}
+.st-working{color:var(--amber)}.st-waiting{color:var(--muted)}.st-killed{color:#4d7a57;text-decoration:line-through}
+.st-stopped{color:var(--red)}.st-needs{color:var(--amber)}
+tr.killed{opacity:.6}
 @media(max-width:640px){th:last-child,td:last-child{display:none}}
-#graph{width:100%;height:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
-svg text{font:11px ui-sans-serif,system-ui,sans-serif;fill:var(--ink);paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
-svg .edge{stroke:var(--muted);stroke-opacity:.35;fill:none}
-svg .edge.channel{stroke-dasharray:5 4;stroke:var(--accent);stroke-opacity:.55}
-svg .node circle{stroke:var(--panel);stroke-width:2px}
-svg .node.coordinator circle{fill:#2563eb}
-svg .node.agent circle{fill:#64748b}
-svg .node.agent.killed circle{fill:#94a3b8}
-svg .node.channel circle{fill:#0f766e}
-svg .node.unknown circle{fill:#a855f7}
-svg .node text{font-weight:600}
-footer{max-width:1000px;margin:0 auto;padding:0 20px 30px}
+#graph{width:100%;height:auto;background:var(--panel);border:1px solid var(--line)}
+svg text{font:11px "Courier New",monospace;fill:var(--ink);paint-order:stroke;stroke:var(--bg);stroke-width:3px;stroke-linejoin:round}
+svg .edge{stroke:var(--muted);stroke-opacity:.5;fill:none}
+svg .edge.channel{stroke-dasharray:5 4;stroke:var(--cyan);stroke-opacity:.7}
+svg .node circle{stroke:var(--bg);stroke-width:2px}
+svg .node.coordinator circle{fill:#00ff41}
+svg .node.agent circle{fill:#1f9c43}
+svg .node.agent.killed circle{fill:#4d7a57}
+svg .node.channel circle{fill:#4dd0c0}
+svg .node.unknown circle{fill:#ffd166}
+svg .node text{font-weight:700}
+footer{max-width:1000px;margin:0 auto;padding:0 20px 30px;color:var(--muted);font-size:11px}
 </style>
 </head>
 <body>
@@ -433,7 +526,7 @@ footer{max-width:1000px;margin:0 auto;padding:0 20px 30px}
     <div id="members"></div>
   </section>
   <section id="tab-graph" data-view="graph" hidden>
-    <p class="muted">Mentions in the last 200 posts. Solid lines are @names, dashed lines are @#channel calls.</p>
+    <p class="muted">MENTION LINKS // LAST 200 POSTS // SOLID = @NAME, DASHED = @#CHANNEL</p>
     <svg id="graph" viewBox="0 0 760 620" role="img" aria-label="mention graph"></svg>
   </section>
 </main>
@@ -511,10 +604,11 @@ footer{max-width:1000px;margin:0 auto;padding:0 20px 30px}
       var p = list[i], art = el('article', 'post'), head = el('div', 'phead');
       head.appendChild(el('span', 'seq', '#' + p.seq));
       head.appendChild(el('span', 'from', p.from));
+      if (p.model) head.appendChild(el('span', 'model', p.model));
       head.appendChild(pill('#' + p.channel, 'chan'));
       head.appendChild(el('span', 'time muted', p.at ? new Date(p.at).toLocaleString() : ''));
-      if (/\[done\]/i.test(p.text)) head.appendChild(pill('done', 'done'));
-      if (/\[blocked\]/i.test(p.text)) head.appendChild(pill('blocked', 'blocked'));
+      if (/\\[done\\]/i.test(p.text)) head.appendChild(pill('done', 'done'));
+      if (/\\[blocked\\]/i.test(p.text)) head.appendChild(pill('blocked', 'blocked'));
       var body = el('div', 'body');
       appendMentions(body, p.text);
       art.appendChild(head);
@@ -528,7 +622,7 @@ footer{max-width:1000px;margin:0 auto;padding:0 20px 30px}
     return 'st st-' + word;
   }
 
-  function memberRow(name, status, chans, sid, dead, m) {
+  function memberRow(name, status, chans, sid, dead, m, model) {
     var tr = el('tr', dead ? 'killed' : '');
     tr.appendChild(el('td', null, '@' + name));
     var td = el('td');
@@ -542,6 +636,7 @@ footer{max-width:1000px;margin:0 auto;padding:0 20px 30px}
       td.appendChild(pill('heals ' + m.heals + '/2', ''));
     }
     tr.appendChild(td);
+    tr.appendChild(el('td', 'model', model || '—'));
     var tc = el('td');
     for (var i = 0; i < chans.length; i++) {
       tc.appendChild(pill('#' + chans[i], 'chan'));
@@ -556,16 +651,16 @@ footer{max-width:1000px;margin:0 auto;padding:0 20px 30px}
     var box = $('members');
     clear(box);
     var table = el('table'), thead = el('thead'), hr = el('tr');
-    ['Member', 'Status', 'Channels', 'Session'].forEach(function (h) { hr.appendChild(el('th', null, h)); });
+    ['Member', 'Status', 'Model', 'Channels', 'Session'].forEach(function (h) { hr.appendChild(el('th', null, h)); });
     thead.appendChild(hr);
     table.appendChild(thead);
     var tb = el('tbody');
-    tb.appendChild(memberRow('coordinator', 'coordinator', data.channels.map(function (c) { return c.name; }), data.coordID, false, null));
+    tb.appendChild(memberRow('coordinator', 'coordinator', data.channels.map(function (c) { return c.name; }), data.coordID, false, null, data.coordModel));
     var ms = data.members.slice().sort(function (a, b) {
       return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
     });
     ms.forEach(function (m) {
-      tb.appendChild(memberRow(m.name, m.status, m.channels, m.sessionID, m.status === 'killed', m));
+      tb.appendChild(memberRow(m.name, m.status, m.channels, m.sessionID, m.status === 'killed', m, m.model));
     });
     table.appendChild(tb);
     box.appendChild(table);
@@ -727,7 +822,13 @@ async function tick() {
   try {
     adoptNewer(); // a newer instance may have posted since our last save
     for (const [coordID, b] of Object.entries(db.swarms)) {
-      for (const [name, m] of Object.entries(b.members ?? {})) {
+      // A board with no live member has nothing to reconcile; skip the
+      // session.get/model list calls and the UI rewrite on every tick.
+      const live = Object.values(b.members ?? {}).some((m) =>
+        m.status !== "killed" && !String(m.status).startsWith("stopped"));
+      if (!live) continue;
+      try { const v = await modelOf(coordID); if (v && v !== b.coordModel) { b.coordModel = v; save(); } } catch {}
+      for (const m of Object.values(b.members ?? {})) {
         try { await reconcileMember(m); } catch {}
       }
       for (let i = waiters.length - 1; i >= 0; i--) {
@@ -743,11 +844,29 @@ async function tick() {
 }
 
 function onEvent(ev) {
-  if (!/session\.(step\.(ended|failed)|idle|error)/i.test(String(ev?.type ?? ""))) return;
+  const action = eventAction(ev);
+  if (!action) return;
   const sid = ev?.data?.sessionID;
   const idx = sid && db.memberIndex[sid];
   const m = idx && db.swarms[idx.coordID]?.members?.[idx.name];
-  if (m) reconcileMember(m).then(() => writeUi(idx.coordID)).catch(() => {});
+  if (!m) return;
+  if (action === "model") {
+    const md = ev?.data?.model;
+    if (md && md.id) {
+      m.model = [md.providerID, md.id].filter(Boolean).join("/");
+      save();
+      writeUi(idx.coordID);
+    }
+    return;
+  }
+  if (action === "deleted") {
+    m.status = "stopped: session deleted";
+    save();
+    writeUi(idx.coordID);
+    return;
+  }
+  reconcileMember(m, action === "error" ? eventError(ev) : "")
+    .then(() => writeUi(idx.coordID)).catch(() => {});
 }
 
 function startEngine() {
@@ -801,11 +920,12 @@ export default {
           "action=status: roster, channels, and the local board UI URL. action=kill {name}: stop a worker or a whole group. " +
           "action=title {title}: name the swarm. " +
           "action=channel {op:create|subscribe|unsubscribe|list|archive, channel, topic, name}: manage channels. " +
-          "action=models: list runnable models. action=model {name,model 'provider/id'}: switch a member's or group's model.",
+          "action=models: list runnable models. action=model {name,model 'provider/id'}: switch a member's or group's model. " +
+           "action=cleanup: remove retired worker sessions (killed/stopped/[done]/[blocked]) and prune empty boards.",
         input: {
           type: "object",
           properties: {
-            action: { type: "string", enum: ["add", "status", "kill", "title", "channel", "models", "model"] },
+            action: { type: "string", enum: ["add", "status", "kill", "title", "channel", "models", "model", "cleanup"] },
             name: { type: "string" },
             brief: { type: "string" },
             title: { type: "string" },
@@ -977,12 +1097,12 @@ export default {
             for (const n of names) {
               const m = h.board.members[n];
               m.status = "killed";
-              try { await ctx.session.interrupt?.({ sessionID: m.sessionID, resume: false }); } catch {}
+              await retireWorkerSession(n, m);
             }
             save();
             writeUi(h.coordID);
-            return { content: names.length === 1 ? `@${names[0]} killed`
-              : `group @${args.name} killed: ${names.join(", ")}` };
+            return { content: names.length === 1 ? `@${names[0]} killed (session removed)`
+              : `group @${args.name} killed (sessions removed): ${names.join(", ")}` };
           }
           if (args.action === "models") {
             try {
@@ -1003,6 +1123,34 @@ export default {
                 await ctx.session.switchModel({ sessionID: target, model: { providerID, id: rest.join("/") } });
               return { content: `@${args.name ?? "coordinator"} switched to ${args.model}` };
             } catch (e) { return { content: "model switch unsupported/failed: " + e.message }; }
+          }
+          if (args.action === "cleanup") {
+            const h = boardFor(sessionID);
+            if (!h) throw new Error("no swarm for this session");
+            // A coordinator cleans every board it owns; a worker cleans only its own.
+            const ids = h.who === "coordinator" ? Object.keys(db.swarms) : [h.coordID];
+            const removed = [];
+            const pruned = [];
+            for (const id of ids) {
+              const b = db.swarms[id];
+              if (!b) continue;
+              for (const [name, m] of Object.entries(b.members ?? {})) {
+                if (!isRetiredMember(m)) continue;
+                if (await retireWorkerSession(name, m)) removed.push(`${id.slice(0, 12)}:${name}`);
+              }
+              const live = Object.values(b.members ?? {}).some((m) => !isRetiredMember(m));
+              if (!live && id !== sessionID) {
+                for (const m of Object.values(b.members ?? {})) delete db.memberIndex[m.sessionID];
+                delete db.swarms[id];
+                db.retired[id] = Date.now();
+                pruned.push(id.slice(0, 12));
+              }
+            }
+            save();
+            return { content: `cleanup: removed ${removed.length} worker session(s)` +
+              (removed.length ? ` [${removed.join(", ")}]` : "") +
+              `; pruned ${pruned.length} empty board(s)` +
+              (pruned.length ? ` [${pruned.join(", ")}]` : "") };
           }
         },
       });
@@ -1114,4 +1262,5 @@ export const _pure = {
   channelOf, channelsOf, isPrivileged, canSee, visiblePosts, defaultChannel,
   wakeHit, mayMove, channelForPost, boardSnapshot, renderBoardHtml,
   expandAddTargets, groupTargets, mentionHit, newerBoards,
+  eventAction, eventError, modelFrom, isRetiredMember,
 };

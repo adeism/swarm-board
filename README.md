@@ -67,7 +67,7 @@ your session (coordinator)          board = append-log with seq numbers
 
 | Tool | Call |
 |---|---|
-| `swarm` | `{action:"add", name:"parser", brief:"…", channels:["parser"]}` — one worker · `{action:"add", name:"parser", brief:"…", n:3}` or `{…, tasks:["lexer","parser"]}` — a group `parser-1…parser-k`, max 8 · `{action:"status"}` (roster incl. channels, quiet time, heal count, `open_board` URL) · `{action:"channel", op:"create"\|"subscribe"\|"unsubscribe"\|"list"\|"archive", channel, topic?, name?}` · `{action:"kill", name}` (a group name kills every copy) · `{action:"title", title}` · `{action:"models"}` / `{action:"model", name, model:"provider/id"}` (group name switches every copy; best effort, untested on this build) |
+| `swarm` | `{action:"add", name:"parser", brief:"…", channels:["parser"]}` — one worker · `{action:"add", name:"parser", brief:"…", n:3}` or `{…, tasks:["lexer","parser"]}` — a group `parser-1…parser-k`, max 8 · `{action:"status"}` (roster incl. channels, quiet time, heal count, `open_board` URL) · `{action:"channel", op:"create"\|"subscribe"\|"unsubscribe"\|"list"\|"archive", channel, topic?, name?}` · `{action:"kill", name}` (a group name kills every copy) · `{action:"title", title}` · `{action:"models"}` lists runnable ids · `{action:"model", name, model:"provider/id"}` switches a member (a group name switches every copy) · `{action:"cleanup"}` removes retired worker sessions and prunes empty boards. Verified on this build; the board shows the live `provider/id`. See [Model per worker](#model-per-worker-one-model-vs-a-mix) |
 | `post_message` | `{text:"@verifier check #4", channel:"parser"}` — mention = wake; `channel` defaults to your work channel |
 | `read_board` | `{since:12}` (your view) · `{since:12, channel:"parser"}` (one channel) · `{channel:"*"}` (everything) |
 | `swarm_wait` | `{since:12}` — waits for your name / `@all` / `@#your-channel`; `{mentions_only:false}` also wakes for plain posts in your channels (60 s cap) |
@@ -140,9 +140,10 @@ browser; there is no server, no network request and no dependency (the file is
 written only when the snapshot changes).
 
 - **Board** — newest first, channel filter and text filter (kept in
-  `sessionStorage`), `[done]` / `[blocked]` badges.
-- **Members** — coordinator plus live state, marker, heal count, channels and
-  session id; the session column is hidden below 640 px.
+  `sessionStorage`), `[done]` / `[blocked]` badges, and the sender's model as a
+  small muted `provider/id` label.
+- **Members** — coordinator plus live state, marker, heal count, **model**,
+  channels and session id; the session column is hidden below 640 px.
 - **Graph** — SVG mention graph from the last 200 posts (solid = `@name`,
   dashed = `@#channel`).
 - Auto-reload every 3 s. The active tab is in the URL hash and filters survive
@@ -151,6 +152,8 @@ written only when the snapshot changes).
   post containing `</script>` cannot break out.
 - Read-only snapshot: no buttons, no live socket, no narrator. It shows all
   channels, including archived ones.
+- Minimal Matrix styling: near-black background, neon-green monospace text, no
+  animated background. Still one self-contained file, no network request.
 
 Tier 2 live check (same server, 2026-11-16):
 
@@ -204,14 +207,121 @@ Handoff etiquette (what makes the graph non-star-shaped):
 Mention only whoever acts next; reference posts by `#seq` instead of
 copy-pasting reports (keeps the coordinator's context small).
 
+## Swarm vs subagent bawaan OpenCode
+
+Both create child sessions with their own context, but **built-in subagents are
+the better default for most tasks**. Reach for a swarm only when you need one of
+the "swarm" capabilities below.
+
+| Need | Built-in subagent (`general`, `explore`) | Swarm board |
+|---|---|---|
+| Relationship | Child session (`parentID`), reports to parent inbox on idle | Standalone session; reports manually via `post_message` + `[done]` |
+| Message direction | Parent ↔ child only; a child cannot message another child | Peer-to-peer: `@author`, `@verifier`, `@#channel` |
+| Long idle | Still a background child, reports each completed round | `swarm_wait` parks at 0 tokens, woken by `@mention` |
+| Scale | One agent per `subagent` call | `n`/`tasks` up to 8 workers + channels to split attention |
+| Trace | Parent inbox, tied to the session | Persistent board + HTML/Graph UI; posts survive a server restart |
+| Monitor | None | Automatic `[stall]` notices, auto-heal for tool calls printed as text |
+| Session tidiness | Child stays under its parent | Root sessions — clean up with `kill` / `cleanup` |
+
+**Use a subagent** for 1–3 independent tasks, a read-only/permission-restricted
+agent (`explore`), or whenever you want to avoid coordination overhead.
+**Use a swarm** for peer handoffs (verifier → author directly), work with long
+idle periods, more than four workers that need channels, or a large audit that
+needs a shared trace. The skill is also labelled "(Preview & Quota Heavy)": the
+coordinator must not do the work itself, so there is a real orchestration cost.
+
+## Model per worker: one model vs a mix
+
+Workers are separate sessions, so each one can run a different model. By default
+a new worker inherits the model of its OpenCode **agent** (`build`), which need
+not be the coordinator's model — in a live check here the coordinator ran
+`opencode/hy4-flash-free` while every worker ran
+`local-router/Qwen3.8-Flash-Next`.
+
+List what is available first:
+
+```
+swarm{action:"models"}     # provider/id list, e.g. local-router/Qwen3.8-27B-NInfer
+```
+
+### A. One model for the whole swarm
+
+Set the same `provider/id` on every member after adding them:
+
+```
+swarm{action:"add", name:"writer",   brief:"Draft the module."}
+swarm{action:"add", name:"reviewer", brief:"Review the draft."}
+swarm{action:"model", name:"writer",   model:"opencode/hy4-flash-free"}
+swarm{action:"model", name:"reviewer", model:"opencode/hy4-flash-free"}
+```
+
+For a group, one call switches all copies:
+`swarm{action:"add", name:"scan", brief:"…", n:3}` then
+`swarm{action:"model", name:"scan", model:"opencode/hy4-flash-free"}`.
+
+### B. Different models per worker
+
+Give each role the model that suits it:
+
+```
+swarm{action:"add", name:"planner", brief:"Break the task into pieces."}
+swarm{action:"add", name:"coder",   brief:"Implement each piece."}
+swarm{action:"add", name:"critic",  brief:"Audit the result."}
+swarm{action:"model", name:"planner", model:"openrouter/anthropic/claude-sonnet-5.5"}
+swarm{action:"model", name:"coder",   model:"openai/gpt-5.3-codex"}
+swarm{action:"model", name:"critic",  model:"local-router/Qwen3.8-27B-NInfer"}
+```
+
+Then hand out the work as usual (`post_message` / `@mention`), park in
+`swarm_wait`, and verify on the **Members** tab: the Model column shows the live
+`provider/id` of every member, and each post header is labelled with the model
+that produced it.
+
+### Copy-paste prompts
+
+Instead of calling the tools yourself, paste one of these into OpenCode and let
+the coordinator translate it into the `add` / `model` / `post_message` calls
+above.
+
+One model for everyone:
+
+```
+@swarm Build a small URL shortener with tests. Use ONE model for every agent:
+opencode/hy4-flash-free. Add a coder and a reviewer, post the briefs on the
+board, park in swarm_wait, verify with your own tests, then kill the workers.
+```
+
+Mixed models:
+
+```
+@swarm Audit this repo. Use a different model per role: planner =
+openrouter/anthropic/claude-sonnet-5.5, coder = openai/gpt-5.3-codex, critic =
+local-router/Qwen3.8-27B-NInfer. Split work per file, coordinate on the board,
+verify with first-party evidence, then kill everyone.
+```
+
+Verified on this build (2026-11-18): `swarm{action:"model", name:"msame",
+model:"opencode/hy4-flash-free"}` returned `@msame switched to
+opencode/hy4-flash-free`, and the session API then reported
+`model: {id:"hy4-flash-free", providerID:"opencode"}`; a second worker switched
+to `local-router/Qwen3.8-27B-NInfer`. The switch applies to the **next**
+inference — messages already in a session keep the model that generated them.
+The board reads the current model from `session.get` on the 15 s tick, so a
+recent switch can take one tick (or the next post) to appear.
+
+One-model demo (same session, later): two workers `onedraft` and `onecheck` were
+both switched to `opencode/hy4-flash-free`; their sessions then reported
+`hy4-flash-free @ opencode`, and board posts #20/#21 were both labelled
+`opencode/hy4-flash-free` — the whole swarm on one model, verified end to end.
+
 ## Autopilot (Tier 1)
 
 The plugin keeps the board honest without the coordinator polling:
 
 | Behavior | What happens |
 |---|---|
-| State reconciliation | Every 15 s, and on `session.step.ended` / `session.error` events, each member's live session is checked. Idle workers flip from `working` to `waiting (idle)`; session errors become `stopped: …`. |
-| Marker state machine | A member post containing `[done]`, `[blocked]` or `[stall]` records that marker beside the live state (`waiting (idle) [done]`), so the upstream skill still sees the word `waiting` and finished members stop counting as pending. |
+| State reconciliation | Every 15 s, and on V2 `session.step.ended` / `session.execution.*` / `session.idle` events, each member's live session is checked. Idle workers flip from `working` to `waiting (idle)`; execution failures become `stopped: <reason>` (incl. quota retry hints). Boards with no live member are skipped entirely — one `session.get` per member per tick, not one for the model plus one for state. |
+| Marker state machine | A member post containing `[done]`, `[blocked]` or `[stall]` records that marker beside the live state (`waiting (idle) [done]`), so the upstream skill still sees the word `waiting` and finished members stop counting as pending. A later `@name` that wakes a parked waiter clears the marker and flips the member back to `working`. |
 | Built-in stall monitor | If the board is quiet for 3 min, workers are still pending, and the coordinator is parked or idle, the plugin posts `@coordinator [stall] quiet … silent: …` from `monitor`. That post resolves a parked `swarm_wait` immediately. Capped at 3 consecutive stalls; any non-monitor post resets the window. |
 | Auto-heal | An idle worker whose last text looks like a literal tool call (`<tool_call>`, `<function=…>`) gets one correction prompt per idle transition, max 2 per session; then `needs help (heal cap)`. |
 
@@ -279,7 +389,12 @@ run two is the local model's tool-calling, not the board — see Limitations.
   2 correction prompts; if the model still refuses, the member shows
   `needs help (heal cap)` — nudge `@name` or kill/replace. Trust raw test output,
   never a worker's claim.
-- No `fork:`, `workspace:"share"` worktrees, or per-provider quota in `models`.
+- No `fork:` or `workspace:"share"/"branch"` semantics on `add` (the V2 APIs
+  `session.fork` / `worktree.create` exist, but a worker needs a fresh context
+  with only its brief — forking a warm coordinator history would be huge, and
+  this machine's worktree discovery is unreliable). `swarm{action:"model"}`
+  switches the session model and is verified; it does not validate
+  quota/availability — a bad id only shows up at the next inference.
   The stall monitor is built into the plugin (no `swarm_monitor` skill/worker
   needed). (`n`/`tasks` groups are implemented — see [Groups](#groups-ntasks).)
 - No narrator (`swarm_narrator`): its upstream UI/protocol is not shipped here.
@@ -302,9 +417,15 @@ run two is the local model's tool-calling, not the board — see Limitations.
 ## Tests
 
 `node --test` (Node 22+, no dependencies): mention and channel parsing,
-visibility and defaults, wake rules, group naming/validation/addressing, and the
-HTML snapshot escaping. The plugin is the test target, so a green run means the
-shipped file — `plugins/swarm-board.js` — behaves as described.
+visibility and defaults, wake rules, group naming/validation/addressing,
+V2 event mapping and error strings, and the HTML snapshot escaping. The plugin
+is the test target, so a green run means the shipped file —
+`plugins/swarm-board.js` — behaves as described. The current working tree passes
+**16/16** tests. Swarm worker sessions are removed on `kill`;
+`swarm{action:"cleanup"}` removes every retired worker session across all owned
+boards (killed / `stopped:` / `[done]` / `[blocked]`) so the OpenCode session
+list does not fill up. A coordinator cleans all its boards; a worker cleans only
+its own board.
 
 ## Attribution & license
 
@@ -318,4 +439,11 @@ shipped file — `plugins/swarm-board.js` — behaves as described.
 - Tools missing after copying: look for `msg="loading plugin" id=swarm-board`
   in `~/.local/share/opencode/log/opencode.log`, then `/reload` or
   `opencode service restart`.
+- Repeated hot-reloads (copying the plugin several times, or editing it many
+  times in a row) can leave several plugin instances with stale in-memory
+  boards writing to the same `swarm-board.json`: sequence numbers collide,
+  `kill` looks reverted in the UI, and phantom `[stall]` posts appear. Fix with
+  `opencode service restart` (optionally delete `swarm-board.json` first for a
+  full reset). `swarm{action:"cleanup"}` writes tombstones for the boards it
+  prunes, so a stale instance cannot resurrect them on its next save.
 - Full reset: stop the server, delete `swarm-board.json`, restart.

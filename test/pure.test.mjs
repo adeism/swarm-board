@@ -190,3 +190,38 @@ test("legacy board without channels still renders and defaults to main", () => {
   assert.deepEqual(ldata.channels.map((c) => c.name), ["main"]);
   assert.deepEqual(ldata.members[0].channels, ["main"]);
 });
+
+test("V2 session event actions", () => {
+  assert.equal(P.eventAction({ type: "session.step.ended" }), "reconcile");
+  assert.equal(P.eventAction({ type: "session.execution.succeeded" }), "reconcile");
+  assert.equal(P.eventAction({ type: "session.execution.failed" }), "error");
+  assert.equal(P.eventAction({ type: "session.execution.interrupted" }), "reconcile");
+  assert.equal(P.eventAction({ type: "session.idle" }), "reconcile");
+  assert.equal(P.eventAction({ type: "session.model.selected" }), "model");
+  assert.equal(P.eventAction({ type: "session.deleted" }), "deleted");
+  assert.equal(P.eventAction({ type: "session.error" }), null, "old event name ignored");
+  assert.equal(P.eventAction({}), null);
+});
+
+test("event error carries reason and quota retry hint", () => {
+  assert.equal(P.eventError({ data: { error: { type: "AI.Error.QuotaExceeded", message: "free tier exhausted", retryAfterMs: 90000 } } }),
+    "AI.Error.QuotaExceeded: free tier exhausted retry 90s");
+  assert.equal(P.eventError({ data: {} }), "");
+  assert.equal(P.eventError({ data: { error: { message: "x".repeat(200) } } }).length, 120);
+});
+
+test("live model is read from session info", () => {
+  assert.equal(P.modelFrom({ model: { providerID: "opencode", id: "hy4-flash-free" } }), "opencode/hy4-flash-free");
+  assert.equal(P.modelFrom({ data: { model: { providerID: "local-router", id: "qwen" } } }), "local-router/qwen");
+  assert.equal(P.modelFrom({ model: { id: "no-provider" } }), "no-provider");
+  assert.equal(P.modelFrom({}), "");
+});
+
+test("retired members are the ones safe to delete", () => {
+  assert.equal(P.isRetiredMember({ status: "killed" }), true);
+  assert.equal(P.isRetiredMember({ status: "stopped: quota" }), true);
+  assert.equal(P.isRetiredMember({ marker: "done", status: "waiting (idle)" }), true);
+  assert.equal(P.isRetiredMember({ marker: "blocked", status: "waiting (idle)" }), true);
+  assert.equal(P.isRetiredMember({ status: "waiting (idle)" }), false);
+  assert.equal(P.isRetiredMember({ status: "working" }), false);
+});
